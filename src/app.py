@@ -10,6 +10,7 @@ import joblib
 import os
 import io
 from datetime import datetime
+from supabase import create_client
 
 # Fix compatibilidad LargeUtf8 con versiones antiguas de Streamlit
 try:
@@ -24,6 +25,17 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ── Conexión Supabase ─────────────────────────────
+@st.cache_resource
+def get_supabase():
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_ANON_KEY"]
+    return create_client(url, key)
+
+supabase = get_supabase()
+# st.write("Supabase conectado:", supabase is not None)
+
 
 # ── CSS personalizado ──────────────────────────────────────────────────────────
 st.markdown("""
