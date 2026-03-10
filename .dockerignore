@@ -1,0 +1,37 @@
+# Control de versiones
+.git
+.gitignore
+
+# Entorno virtual uv
+.venv
+.uv
+
+# Datos crudos y procesados (pesados, no van en la imagen)
+data/
+notebooks/
+*.ipynb
+
+# Modelos intermedios (solo va el final)
+models/mejor_ensemble.pkl
+
+# Archivos de entorno y secrets locales
+.env
+.streamlit/secrets.toml
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Documentación y outputs del sprint
+*.md
+*.docx
+*.pdf
+docs/
+
+# OS
+.DS_Store
+Thumbs.db
