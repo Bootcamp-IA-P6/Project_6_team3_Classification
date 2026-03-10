@@ -1,4 +1,4 @@
-# 🏋️‍♂️ Data Science and Animal Prevention
+#  Data Science and Animal Prevention
   
 
 ### 📋 Descripción
@@ -39,8 +39,7 @@ Desequilibrio Crítico en "At Risk" (3.7%): Esta es la clase minoritaria (solo 4
 
 Regreso al Dueño (19.1%): Aproximadamente 1 de cada 5 animales se pierde y logra reencontrarse con su familia original.
 
- <img src="../Project_6_team3_Classification/reports/figures/01_class_distribution.png">
-
+  <img src="https://github.com/Bootcamp-IA-P6/Project_6_team3_Classification/blob/feat/ensemble_1/reports/figures/01_class_distribution.png?raw=true" width="850">  
 ---
 
 ### 💡 Beneficios Técnicos del Modelo Predictivo
