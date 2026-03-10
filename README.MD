@@ -92,9 +92,9 @@ Regreso al Dueño (19.1%): Aproximadamente 1 de cada 5 animales se pierde y logr
 ### 📦 Instalación Local
 
 **1️⃣ Clonar el repositorio**
-bash
+```bash
 git clone [Refugio ](https://github.com/Bootcamp-IA-P6/Project_6_team3_Classification.git)
-
+```
 
 ## Configurar variables de entorno Crea un archivo .env en la raíz del proyecto con tus credenciales de Supabase:
 
@@ -105,14 +105,15 @@ git clone [Refugio ](https://github.com/Bootcamp-IA-P6/Project_6_team3_Classific
 * DATABASE_URL=postgresql://postgres:password@db.supabase.co:5432/postgres
 
 3️⃣ Instalar dependencias
-Bash
-uv add -r requirements.txt
+```Bash
+uv sync
+```
 
 4️⃣ Ejecutar la aplicación
 
-Bash
-streamlit run app.py
-💡 La documentación automática estará disponible en: http://localhost:8000/docs
+```Bash
+uv run streamlit run src/app.py
+```
 
 ## 🐳 Dockerización
 El proyecto está completamente preparado para entornos de contenedores, lo que garantiza que funcione de manera idéntica en cualquier máquina.
@@ -123,13 +124,13 @@ Docker Compose: Orquesta el backend, mapea los puertos (8000:8000) y carga autom
 
 ## Comandos rápidos:
 
-Bash
+```Bash
 ### Construir la imagen
 docker-compose build
 
 ### Levantar el sistema
 docker-compose up -d
-
+```
 
 📁 Estructura del Proyecto/ Refugio animals 
 
