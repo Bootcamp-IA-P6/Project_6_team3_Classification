@@ -1,4 +1,4 @@
-# 🏋️‍♂️ Data Science and Animal Prevention
+#  Data Science and Animal Prevention
   
 
 ### 📋 Descripción
