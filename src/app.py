@@ -10,6 +10,7 @@ import joblib
 import os
 import io
 from datetime import datetime
+from supabase import create_client, Client
 
 # Fix compatibilidad LargeUtf8 con versiones antiguas de Streamlit
 try:
@@ -58,7 +59,6 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
     background: #161b27;
     border: 1px solid #1e2535;
     border-radius: 12px;
-    #padding: 1.5rem;
     margin-bottom: 1rem;
 }
 
@@ -251,7 +251,7 @@ AGE_ORDER = ["Cachorro (<6m)", "Joven (6m-1a)", "Adulto joven (1-3a)", "Adulto (
 FEATURE_OPTIONS = {
     "AnimalType":      ["Dog", "Cat"],
     "Sex":             ["Male", "Female", "Neutered Male", "Spayed Female", "Intact Male", "Intact Female"],
-    "IntakeType":      ["Stray", "Owner Surrender", "Public Assist", "Euthanasia Request",  "Abandoned"],
+    "IntakeType":      ["Stray", "Owner Surrender", "Public Assist", "Euthanasia Request", "Abandoned"],
     "IntakeCondition": ["Normal", "Injured", "Sick", "Aged", "Feral", "Pregnant", "Nursing"],
     "AgeGroup":        AGE_ORDER,
     "breed_type":      ["mix", "purebred"],
@@ -271,17 +271,6 @@ FORM_DEFAULTS = {
     "form_season":    "Primavera",
 }
 
-FORM_KEY_MAP = {
-    "AnimalType":      "form_animal",
-    "Sex":             "form_sex",
-    "IntakeType":      "form_intake",
-    "IntakeCondition": "form_condition",
-    "AgeGroup":        "form_age",
-    "breed_type":      "form_breed",
-    "Color_grouped":   "form_color",
-    "Season":          "form_season",
-}
-
 # ── Inicializar session state ─────────────────────────────────────────────────
 if "history" not in st.session_state:
     st.session_state.history = []
@@ -295,7 +284,6 @@ for k, v in FORM_DEFAULTS.items():
 # ── Funciones auxiliares ───────────────────────────────────────────────────────
 @st.cache_resource
 def load_artifacts():
-    """Carga el modelo, preprocesador, le_target y umbral óptimo."""
     model, preprocessor, le_target, umbral = None, None, None, 0.5
     try:
         model        = joblib.load("models/xgboost_optimizado.pkl")
@@ -308,6 +296,68 @@ def load_artifacts():
     except Exception:
         umbral = 0.5
     return model, preprocessor, le_target, umbral
+
+
+@st.cache_resource
+def get_supabase():
+    """Conecta con Supabase usando secrets. Devuelve None si no está configurado."""
+    try:
+        url = st.secrets["supabase"]["url"]
+        key = st.secrets["supabase"]["key"]
+        return create_client(url, key)
+    except Exception:
+        return None
+
+
+def guardar_prediccion_supabase(sb, nombre, form_data, clase, proba_dict, nivel_riesgo, umbral, fuente="individual"):
+    """Inserta una predicción en Supabase. Silencia errores para no interrumpir la app."""
+    if sb is None:
+        return False
+    try:
+        sb.table("predicciones").insert({
+            "nombre":           nombre or "—",
+            "animal_type":      form_data.get("AnimalType", ""),
+            "sex":              form_data.get("Sex", ""),
+            "intake_type":      form_data.get("IntakeType", ""),
+            "intake_condition": form_data.get("IntakeCondition", ""),
+            "age_group":        form_data.get("AgeGroup", ""),
+            "breed_type":       form_data.get("breed_type", ""),
+            "color_grouped":    form_data.get("Color_grouped", ""),
+            "season":           form_data.get("Season", ""),
+            "prediccion":       clase,
+            "confianza":        round(proba_dict.get(clase, 0), 4),
+            "prob_adoption":    round(proba_dict.get("Adoption", 0), 4),
+            "prob_transfer":    round(proba_dict.get("Transfer", 0), 4),
+            "prob_return":      round(proba_dict.get("Return to Owner", 0), 4),
+            "prob_atrisk":      round(proba_dict.get("At Risk", 0), 4),
+            "nivel_riesgo":     nivel_riesgo,
+            "umbral_usado":     round(umbral, 4),
+            "fuente":           fuente,
+        }).execute()
+        return True
+    except Exception as e:
+        st.warning(f"⚠️ No se pudo guardar en Supabase: {e}")
+        return False
+
+
+def guardar_feedback_supabase(sb, entry):
+    """Inserta un registro de feedback en Supabase."""
+    if sb is None:
+        return False
+    try:
+        sb.table("feedback").insert({
+            "nombre":      entry.get("nombre", "—"),
+            "prediccion":  entry.get("prediccion", ""),
+            "real":        entry.get("real", ""),
+            "correcto":    entry.get("correcto", False),
+            "prob_atrisk": entry.get("at_risk_p", 0),
+            "notas":       entry.get("notas", ""),
+            "fuente":      entry.get("fuente", "manual"),
+        }).execute()
+        return True
+    except Exception as e:
+        st.warning(f"⚠️ No se pudo guardar el feedback en Supabase: {e}")
+        return False
 
 
 def age_to_days(age_group: str) -> float:
@@ -338,19 +388,16 @@ def build_input_df(form_data: dict) -> pd.DataFrame:
 
 
 def predict(input_df, model, preprocessor, le_target, umbral=0.5):
-    """Devuelve (clase_predicha, dict_probabilidades). Aplica umbral óptimo para At Risk."""
     X_proc     = preprocessor.transform(input_df)
     proba      = model.predict_proba(X_proc)[0]
     classes    = le_target.classes_
     proba_dict = {cls: float(p) for cls, p in zip(classes, proba)}
-
     at_risk_prob = proba_dict.get("At Risk", 0.0)
     if at_risk_prob >= umbral:
         clase = "At Risk"
     else:
         pred_idx = int(proba.argmax())
         clase    = le_target.inverse_transform([pred_idx])[0]
-
     return clase, proba_dict
 
 
@@ -429,16 +476,13 @@ def render_result_card(clase: str, proba_dict: dict, form_data: dict, animal_nam
     )
     st.markdown(card_html, unsafe_allow_html=True)
     st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
-
     st.markdown("**Distribución de probabilidades**")
     render_prob_bars(proba_dict)
 
     if clase == "At Risk" or at_risk_p > 0.15:
         st.markdown("<hr class='divider'>", unsafe_allow_html=True)
-
         lvl, lvl_label, badge_cls = risk_level(at_risk_p)
         bar_color = {"low": "#4ade80", "medium": "#fbbf24", "high": "#f87171"}[lvl]
-
         risk_html = (
             f"<div style='margin-bottom:1rem;'>"
             f"<div style='display:flex;align-items:center;gap:0.8rem;margin-bottom:0.4rem;'>"
@@ -473,13 +517,13 @@ def render_result_card(clase: str, proba_dict: dict, form_data: dict, animal_nam
         st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
         st.markdown("**Estrategias de intervención recomendadas**")
         for strat in STRATEGIES[lvl]:
-            strat_html = (
+            st.markdown(
                 f"<div class='strategy-card'>"
                 f"<div class='strategy-title'>{strat['title']}</div>"
                 f"<div class='strategy-body'>{strat['body']}</div>"
-                f"</div>"
+                f"</div>",
+                unsafe_allow_html=True
             )
-            st.markdown(strat_html, unsafe_allow_html=True)
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -492,7 +536,6 @@ with st.sidebar:
         unsafe_allow_html=True
     )
 
-    # Navegación programática desde historial
     if st.session_state.get("nav_page"):
         default_page = st.session_state["nav_page"]
         st.session_state["nav_page"] = None
@@ -501,10 +544,8 @@ with st.sidebar:
         default_page = "🔮 Predicción individual"
 
     PAGES = ["🔮 Predicción individual", "📂 Carga masiva (CSV)", "📋 Historial", "📊 Feedback", "ℹ️ Información"]
-
     page = st.radio(
-        "Navegación",
-        PAGES,
+        "Navegación", PAGES,
         index=PAGES.index(default_page),
         key=f"nav_radio_{st.session_state.get('radio_key', 0)}",
         label_visibility="collapsed"
@@ -512,6 +553,7 @@ with st.sidebar:
 
     st.markdown("<hr style='border-color:#1e2535;margin:1.5rem 0;'>", unsafe_allow_html=True)
 
+    # ── Cargar modelo ──────────────────────────────────────────────────────
     model, preprocessor, le_target, umbral = load_artifacts()
     if model is not None:
         st.markdown(
@@ -531,6 +573,27 @@ with st.sidebar:
             "<div style='background:#1f0505;border:1px solid #7f1d1d;border-radius:8px;padding:0.7rem 1rem;'>"
             "<div style='color:#f87171;font-size:0.82rem;font-weight:600;'>⚠️ Modelo no encontrado</div>"
             "<div style='color:#6b7280;font-size:0.75rem;margin-top:2px;'>Ejecuta el notebook 04 primero</div>"
+            "</div>",
+            unsafe_allow_html=True
+        )
+
+    # ── Estado Supabase ────────────────────────────────────────────────────
+    sb = get_supabase()
+    if sb:
+        st.markdown(
+            "<div style='background:#0c1a2e;border:1px solid #2563eb;border-radius:8px;"
+            "padding:0.7rem 1rem;margin-top:0.5rem;'>"
+            "<div style='color:#60a5fa;font-size:0.82rem;font-weight:600;'>🗄️ Supabase conectado</div>"
+            "<div style='color:#6b7280;font-size:0.75rem;margin-top:2px;'>Datos sincronizados en la nube</div>"
+            "</div>",
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            "<div style='background:#1c1003;border:1px solid #d97706;border-radius:8px;"
+            "padding:0.7rem 1rem;margin-top:0.5rem;'>"
+            "<div style='color:#fbbf24;font-size:0.82rem;font-weight:600;'>⚠️ Supabase no configurado</div>"
+            "<div style='color:#6b7280;font-size:0.75rem;margin-top:2px;'>Añade .streamlit/secrets.toml</div>"
             "</div>",
             unsafe_allow_html=True
         )
@@ -556,18 +619,13 @@ if page == "🔮 Predicción individual":
     st.markdown('<div class="main-title">Predicción individual</div>', unsafe_allow_html=True)
     st.markdown('<div class="main-subtitle">Introduce los datos del animal para obtener su pronóstico de outcome</div>', unsafe_allow_html=True)
 
-    FORM_DEFAULTS = {
-        "val_nombre":    "",
-        "val_animal":    "Dog",
-        "val_sex":       "Male",
-        "val_intake":    "Stray",
-        "val_condition": "Normal",
-        "val_age":       "Adulto joven (1-3a)",
-        "val_breed":     "mix",
-        "val_color":     "Monocolor",
-        "val_season":    "Primavera",
+    VAL_DEFAULTS = {
+        "val_nombre": "", "val_animal": "Dog", "val_sex": "Male",
+        "val_intake": "Stray", "val_condition": "Normal",
+        "val_age": "Adulto joven (1-3a)", "val_breed": "mix",
+        "val_color": "Monocolor", "val_season": "Primavera",
     }
-    for k, v in FORM_DEFAULTS.items():
+    for k, v in VAL_DEFAULTS.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
@@ -577,7 +635,6 @@ if page == "🔮 Predicción individual":
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown("**Datos del animal**")
 
-        # Sincronizar nombre solo cuando viene del historial (reabrir)
         if st.session_state.get("restore_nombre"):
             st.session_state["form_nombre"] = st.session_state["val_nombre"]
             st.session_state["restore_nombre"] = False
@@ -585,69 +642,60 @@ if page == "🔮 Predicción individual":
         animal_name = st.text_input(
             "Nombre del animal (opcional)",
             placeholder="Ej: Luna, Max...",
-            #value=st.session_state["val_nombre"],
             key="form_nombre"
         )
         st.session_state["val_nombre"] = animal_name
 
         c1, c2 = st.columns(2)
         with c1:
-            animal_type = st.selectbox("Tipo de animal",       FEATURE_OPTIONS["AnimalType"],
-                index=FEATURE_OPTIONS["AnimalType"].index(st.session_state["val_animal"]),
-                key="form_animal")
+            animal_type = st.selectbox("Tipo de animal", FEATURE_OPTIONS["AnimalType"],
+                index=FEATURE_OPTIONS["AnimalType"].index(st.session_state["val_animal"]), key="form_animal")
             st.session_state["val_animal"] = animal_type
 
-            intake_type = st.selectbox("Tipo de ingreso",      FEATURE_OPTIONS["IntakeType"],
-                index=FEATURE_OPTIONS["IntakeType"].index(st.session_state["val_intake"]),
-                key="form_intake")
+            intake_type = st.selectbox("Tipo de ingreso", FEATURE_OPTIONS["IntakeType"],
+                index=FEATURE_OPTIONS["IntakeType"].index(st.session_state["val_intake"]), key="form_intake")
             st.session_state["val_intake"] = intake_type
 
-            age_group   = st.selectbox("Grupo de edad",        FEATURE_OPTIONS["AgeGroup"],
-                index=FEATURE_OPTIONS["AgeGroup"].index(st.session_state["val_age"]),
-                key="form_age")
+            age_group = st.selectbox("Grupo de edad", FEATURE_OPTIONS["AgeGroup"],
+                index=FEATURE_OPTIONS["AgeGroup"].index(st.session_state["val_age"]), key="form_age")
             st.session_state["val_age"] = age_group
 
-            breed_type  = st.selectbox("Tipo de raza",         FEATURE_OPTIONS["breed_type"],
-                index=FEATURE_OPTIONS["breed_type"].index(st.session_state["val_breed"]),
-                key="form_breed")
+            breed_type = st.selectbox("Tipo de raza", FEATURE_OPTIONS["breed_type"],
+                index=FEATURE_OPTIONS["breed_type"].index(st.session_state["val_breed"]), key="form_breed")
             st.session_state["val_breed"] = breed_type
 
         with c2:
-            sex         = st.selectbox("Sexo",                 FEATURE_OPTIONS["Sex"],
-                index=FEATURE_OPTIONS["Sex"].index(st.session_state["val_sex"]),
-                key="form_sex")
+            sex = st.selectbox("Sexo", FEATURE_OPTIONS["Sex"],
+                index=FEATURE_OPTIONS["Sex"].index(st.session_state["val_sex"]), key="form_sex")
             st.session_state["val_sex"] = sex
 
             intake_cond = st.selectbox("Condición de ingreso", FEATURE_OPTIONS["IntakeCondition"],
-                index=FEATURE_OPTIONS["IntakeCondition"].index(st.session_state["val_condition"]),
-                key="form_condition")
+                index=FEATURE_OPTIONS["IntakeCondition"].index(st.session_state["val_condition"]), key="form_condition")
             st.session_state["val_condition"] = intake_cond
 
-            color_group = st.selectbox("Color",                FEATURE_OPTIONS["Color_grouped"],
-                index=FEATURE_OPTIONS["Color_grouped"].index(st.session_state["val_color"]),
-                key="form_color")
+            color_group = st.selectbox("Color", FEATURE_OPTIONS["Color_grouped"],
+                index=FEATURE_OPTIONS["Color_grouped"].index(st.session_state["val_color"]), key="form_color")
             st.session_state["val_color"] = color_group
 
-            season      = st.selectbox("Estación de ingreso",  FEATURE_OPTIONS["Season"],
-                index=FEATURE_OPTIONS["Season"].index(st.session_state["val_season"]),
-                key="form_season")
+            season = st.selectbox("Estación de ingreso", FEATURE_OPTIONS["Season"],
+                index=FEATURE_OPTIONS["Season"].index(st.session_state["val_season"]), key="form_season")
             st.session_state["val_season"] = season
 
         st.markdown("</div>", unsafe_allow_html=True)
 
         predict_btn = st.button("🔮 Predecir outcome", use_container_width=True)
         if st.button("🗑️ Limpiar formulario", use_container_width=True):
-            for k, v in FORM_DEFAULTS.items():
+            for k, v in VAL_DEFAULTS.items():
                 st.session_state[k] = v
             st.session_state["restore_nombre"] = True
             st.experimental_rerun()
 
     with col_result:
         form_data = {
-            "AnimalType":     animal_type,  "Sex":             sex,
-            "IntakeType":     intake_type,  "IntakeCondition": intake_cond,
-            "AgeGroup":       age_group,    "breed_type":      breed_type,
-            "Color_grouped":  color_group,  "Season":          season,
+            "AnimalType": animal_type, "Sex": sex,
+            "IntakeType": intake_type, "IntakeCondition": intake_cond,
+            "AgeGroup": age_group, "breed_type": breed_type,
+            "Color_grouped": color_group, "Season": season,
         }
 
         if predict_btn:
@@ -658,6 +706,9 @@ if page == "🔮 Predicción individual":
                     input_df          = build_input_df(form_data)
                     clase, proba_dict = predict(input_df, model, preprocessor, le_target, umbral)
 
+                lvl, lvl_label, _ = risk_level(proba_dict.get("At Risk", 0))
+
+                # Guardar en historial local
                 st.session_state.history.append({
                     "timestamp": datetime.now().strftime("%H:%M:%S"),
                     "nombre":    animal_name or "—",
@@ -666,6 +717,13 @@ if page == "🔮 Predicción individual":
                     "at_risk_p": proba_dict.get("At Risk", 0),
                     "form":      form_data.copy(),
                 })
+
+                # Guardar en Supabase
+                guardar_prediccion_supabase(
+                    sb, animal_name, form_data,
+                    clase, proba_dict, lvl, umbral,
+                    fuente="individual"
+                )
 
                 render_result_card(clase, proba_dict, form_data, animal_name)
         else:
@@ -689,8 +747,8 @@ elif page == "📂 Carga masiva (CSV)":
     st.markdown('<div class="main-subtitle">Sube un CSV con varios animales para predecir todos a la vez</div>', unsafe_allow_html=True)
 
     template_cols = ["nombre", "AnimalType", "Sex", "IntakeType",
-                    "IntakeCondition", "AgeGroup", "breed_type", "Color_grouped", "Season"]
-    template_df   = pd.DataFrame([
+                     "IntakeCondition", "AgeGroup", "breed_type", "Color_grouped", "Season"]
+    template_df = pd.DataFrame([
         ["Luna",  "Dog", "Spayed Female", "Stray",           "Normal",  "Cachorro (<6m)",      "mix",      "Bicolor",   "Primavera"],
         ["Mochi", "Cat", "Intact Male",   "Owner Surrender", "Injured", "Senior (>7a)",         "purebred", "Monocolor", "Invierno"],
         ["Rex",   "Dog", "Intact Male",   "Stray",           "Normal",  "Adulto joven (1-3a)", "mix",      "Tricolor",  "Verano"],
@@ -701,8 +759,7 @@ elif page == "📂 Carga masiva (CSV)":
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown("**📥 Plantilla CSV**")
         st.markdown("<div style='color:#6b7280;font-size:0.85rem;margin-bottom:0.8rem;'>Descarga la plantilla, rellénala y súbela.</div>", unsafe_allow_html=True)
-        csv_tpl = template_df.to_csv(index=False).encode("utf-8")
-        st.download_button("Descargar plantilla", csv_tpl, "plantilla_animales.csv", "text/csv")
+        st.download_button("Descargar plantilla", template_df.to_csv(index=False).encode("utf-8"), "plantilla_animales.csv", "text/csv")
         st.dataframe(template_df.astype(str), use_container_width=True, height=140)
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -725,21 +782,23 @@ elif page == "📂 Carga masiva (CSV)":
                 prog    = st.progress(0)
                 for i, row in df_up.iterrows():
                     fd = {
-                        "AnimalType":     row.get("AnimalType",     "Dog"),
-                        "Sex":            row.get("Sex",            "Male"),
-                        "IntakeType":     row.get("IntakeType",     "Stray"),
-                        "IntakeCondition":row.get("IntakeCondition","Normal"),
-                        "AgeGroup":       row.get("AgeGroup",       "Adulto joven (1-3a)"),
-                        "breed_type":     row.get("breed_type",     "mix"),
-                        "Color_grouped":  row.get("Color_grouped",  "Monocolor"),
-                        "Season":         row.get("Season",         "Primavera"),
+                        "AnimalType":      row.get("AnimalType",     "Dog"),
+                        "Sex":             row.get("Sex",            "Male"),
+                        "IntakeType":      row.get("IntakeType",     "Stray"),
+                        "IntakeCondition": row.get("IntakeCondition","Normal"),
+                        "AgeGroup":        row.get("AgeGroup",       "Adulto joven (1-3a)"),
+                        "breed_type":      row.get("breed_type",     "mix"),
+                        "Color_grouped":   row.get("Color_grouped",  "Monocolor"),
+                        "Season":          row.get("Season",         "Primavera"),
                     }
                     inp               = build_input_df(fd)
                     clase, proba_dict = predict(inp, model, preprocessor, le_target, umbral)
                     at_risk_p         = proba_dict.get("At Risk", 0)
                     lvl, lvl_label, _ = risk_level(at_risk_p)
+                    nombre_animal     = row.get("nombre", f"Animal {i+1}")
+
                     results.append({
-                        "Nombre":          row.get("nombre", f"Animal {i+1}"),
+                        "Nombre":          nombre_animal,
                         "Predicción":      CLASS_CONFIG[clase]["label_es"],
                         "Confianza (%)":   round(proba_dict.get(clase, 0) * 100, 1),
                         "P(At Risk) (%)":  round(at_risk_p * 100, 1),
@@ -747,6 +806,22 @@ elif page == "📂 Carga masiva (CSV)":
                         "P(Adoption) (%)": round(proba_dict.get("Adoption", 0) * 100, 1),
                         "P(Transfer) (%)": round(proba_dict.get("Transfer", 0) * 100, 1),
                         "P(Return) (%)":   round(proba_dict.get("Return to Owner", 0) * 100, 1),
+                    })
+
+                    # Guardar en Supabase
+                    guardar_prediccion_supabase(
+                        sb, nombre_animal, fd,
+                        clase, proba_dict, lvl, umbral,
+                        fuente="masiva"
+                    )
+
+                    st.session_state.history.append({
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "nombre":    nombre_animal,
+                        "clase":     clase,
+                        "prob":      proba_dict.get(clase, 0),
+                        "at_risk_p": at_risk_p,
+                        "form":      {},
                     })
                     prog.progress((i + 1) / len(df_up))
 
@@ -762,23 +837,12 @@ elif page == "📂 Carga masiva (CSV)":
                 c3.metric("🚨 Riesgo alto",       n_risk)
 
                 st.dataframe(df_res.astype(str), use_container_width=True)
-
-                csv_out = df_res.to_csv(index=False).encode("utf-8")
                 st.download_button(
-                    "📥 Descargar resultados CSV", csv_out,
+                    "📥 Descargar resultados CSV",
+                    df_res.to_csv(index=False).encode("utf-8"),
                     f"predicciones_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                     "text/csv"
                 )
-
-                for _, row in df_res.iterrows():
-                    st.session_state.history.append({
-                        "timestamp": datetime.now().strftime("%H:%M:%S"),
-                        "nombre":    row["Nombre"],
-                        "clase":     next(k for k, v in CLASS_CONFIG.items() if v["label_es"] == row["Predicción"]),
-                        "prob":      float(row["Confianza (%)"]) / 100,
-                        "at_risk_p": float(row["P(At Risk) (%)"]) / 100,
-                        "form":      {},
-                    })
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -811,7 +875,6 @@ elif page == "📋 Historial":
         c4.metric("P(At Risk) media",     f"{avg_rp:.1f}%")
 
         st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
-
         color_map_cls = {
             "Adoption": "#4ade80", "Transfer": "#60a5fa",
             "Return to Owner": "#fbbf24", "At Risk": "#f87171",
@@ -821,7 +884,6 @@ elif page == "📋 Historial":
             cfg   = CLASS_CONFIG[h["clase"]]
             color = color_map_cls[h["clase"]]
             lvl, lvl_label, badge = risk_level(h["at_risk_p"])
-
             col_info, col_btn = st.columns([5, 1])
             with col_info:
                 st.markdown(
@@ -836,7 +898,7 @@ elif page == "📋 Historial":
                 )
             with col_btn:
                 if h.get("form") and st.button("↩ Reabrir", key=f"reopen_{idx}", use_container_width=True):
-                    st.session_state["val_nombre"] = h["nombre"] if h["nombre"] != "—" else ""
+                    st.session_state["val_nombre"]    = h["nombre"] if h["nombre"] != "—" else ""
                     st.session_state["restore_nombre"] = True
                     st.session_state["val_animal"]    = h["form"].get("AnimalType",     "Dog")
                     st.session_state["val_sex"]       = h["form"].get("Sex",            "Male")
@@ -850,7 +912,6 @@ elif page == "📋 Historial":
                     st.experimental_rerun()
 
         st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
-
         df_hist = pd.DataFrame([{
             "Hora":       h["timestamp"],
             "Nombre":     h["nombre"],
@@ -873,6 +934,7 @@ elif page == "📋 Historial":
                 st.session_state.history = []
                 st.experimental_rerun()
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PÁGINA 4 — FEEDBACK
 # ══════════════════════════════════════════════════════════════════════════════
@@ -885,13 +947,10 @@ elif page == "📊 Feedback":
     ES_TO_EN      = dict(zip(CLASSES_ES, CLASSES_EN))
     EN_TO_ES      = dict(zip(CLASSES_EN, CLASSES_ES))
 
-    # Inicializar feedback en session_state
     if "feedback_list" not in st.session_state:
-        # Cargar desde disco si existe
         if os.path.exists(FEEDBACK_PATH):
             try:
-                df_fb_load = pd.read_csv(FEEDBACK_PATH)
-                st.session_state.feedback_list = df_fb_load.to_dict("records")
+                st.session_state.feedback_list = pd.read_csv(FEEDBACK_PATH).to_dict("records")
             except Exception:
                 st.session_state.feedback_list = []
         else:
@@ -902,10 +961,8 @@ elif page == "📊 Feedback":
 
     tab_form, tab_metrics = st.tabs(["📝 Registrar feedback", "📈 Métricas en tiempo real"])
 
-    # ── TAB 1: FORMULARIO ─────────────────────────────────────────────────────
     with tab_form:
         st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
-
         col_a, col_b = st.columns(2, gap="large")
 
         # ── OPCIÓN A: desde historial ──────────────────────────────────────
@@ -939,20 +996,21 @@ elif page == "📊 Feedback":
 
                 if st.button("✅ Guardar feedback", use_container_width=True, key="fb_hist_btn"):
                     entry = {
-                        "timestamp":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "nombre":      selected_h["nombre"],
-                        "prediccion":  selected_h["clase"],
-                        "real":        ES_TO_EN[real_from_hist],
-                        "correcto":    selected_h["clase"] == ES_TO_EN[real_from_hist],
-                        "at_risk_p":   round(selected_h["at_risk_p"] * 100, 1),
-                        "notas":       notes_hist,
-                        "fuente":      "historial",
+                        "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "nombre":     selected_h["nombre"],
+                        "prediccion": selected_h["clase"],
+                        "real":       ES_TO_EN[real_from_hist],
+                        "correcto":   selected_h["clase"] == ES_TO_EN[real_from_hist],
+                        "at_risk_p":  round(selected_h["at_risk_p"] * 100, 1),
+                        "notas":      notes_hist,
+                        "fuente":     "historial",
                     }
                     st.session_state.feedback_list.append(entry)
-                    # Guardar en disco
+                    guardar_feedback_supabase(sb, entry)
                     os.makedirs("data", exist_ok=True)
                     pd.DataFrame(st.session_state.feedback_list).to_csv(FEEDBACK_PATH, index=False)
-                    st.success(f"✅ Feedback guardado — {'✓ Correcto' if entry['correcto'] else '✗ Incorrecto'}")
+                    saved_msg = "en Supabase y local" if sb else "localmente"
+                    st.success(f"✅ Feedback guardado {saved_msg} — {'✓ Correcto' if entry['correcto'] else '✗ Incorrecto'}")
 
             st.markdown("</div>", unsafe_allow_html=True)
 
@@ -973,34 +1031,35 @@ elif page == "📊 Feedback":
                     st.warning("Introduce un nombre para identificar al animal.")
                 else:
                     entry = {
-                        "timestamp":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "nombre":      nombre_free.strip(),
-                        "prediccion":  ES_TO_EN[pred_free],
-                        "real":        ES_TO_EN[real_free],
-                        "correcto":    pred_free == real_free,
-                        "at_risk_p":   at_risk_free,
-                        "notas":       notes_free,
-                        "fuente":      "manual",
+                        "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "nombre":     nombre_free.strip(),
+                        "prediccion": ES_TO_EN[pred_free],
+                        "real":       ES_TO_EN[real_free],
+                        "correcto":   pred_free == real_free,
+                        "at_risk_p":  at_risk_free,
+                        "notas":      notes_free,
+                        "fuente":     "manual",
                     }
                     st.session_state.feedback_list.append(entry)
+                    guardar_feedback_supabase(sb, entry)
                     os.makedirs("data", exist_ok=True)
                     pd.DataFrame(st.session_state.feedback_list).to_csv(FEEDBACK_PATH, index=False)
-                    st.success(f"✅ Feedback guardado — {'✓ Correcto' if entry['correcto'] else '✗ Incorrecto'}")
+                    saved_msg = "en Supabase y local" if sb else "localmente"
+                    st.success(f"✅ Feedback guardado {saved_msg} — {'✓ Correcto' if entry['correcto'] else '✗ Incorrecto'}")
 
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # ── TABLA FEEDBACK REGISTRADO ──────────────────────────────────────
         if st.session_state.feedback_list:
             st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
             st.markdown("**Feedback registrado en esta sesión**")
             df_fb_show = pd.DataFrame([{
-                "Hora":        f["timestamp"][-8:],
-                "Nombre":      f["nombre"],
-                "Predicción":  EN_TO_ES.get(f["prediccion"], f["prediccion"]),
-                "Real":        EN_TO_ES.get(f["real"], f["real"]),
-                "✓/✗":        "✓" if f["correcto"] else "✗",
-                "P(At Risk)":  f"{f['at_risk_p']}%",
-                "Fuente":      f["fuente"],
+                "Hora":       f["timestamp"][-8:],
+                "Nombre":     f["nombre"],
+                "Predicción": EN_TO_ES.get(f["prediccion"], f["prediccion"]),
+                "Real":       EN_TO_ES.get(f["real"], f["real"]),
+                "✓/✗":       "✓" if f["correcto"] else "✗",
+                "P(At Risk)": f"{f['at_risk_p']}%",
+                "Fuente":     f["fuente"],
             } for f in st.session_state.feedback_list])
             st.dataframe(df_fb_show.astype(str), use_container_width=True)
 
@@ -1020,10 +1079,8 @@ elif page == "📊 Feedback":
                         os.remove(FEEDBACK_PATH)
                     st.experimental_rerun()
 
-    # ── TAB 2: MÉTRICAS ───────────────────────────────────────────────────────
     with tab_metrics:
         st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
-
         fb = st.session_state.feedback_list
         if len(fb) < 2:
             st.markdown(
@@ -1034,11 +1091,10 @@ elif page == "📊 Feedback":
                 unsafe_allow_html=True
             )
         else:
-            df_fb = pd.DataFrame(fb)
+            df_fb  = pd.DataFrame(fb)
             y_pred = df_fb["prediccion"].tolist()
             y_real = df_fb["real"].tolist()
 
-            # ── Métricas resumen ──────────────────────────────────────────
             accuracy   = sum(p == r for p, r in zip(y_pred, y_real)) / len(y_pred)
             at_risk_tp = sum(1 for p, r in zip(y_pred, y_real) if r == "At Risk" and p == "At Risk")
             at_risk_fn = sum(1 for p, r in zip(y_pred, y_real) if r == "At Risk" and p != "At Risk")
@@ -1048,35 +1104,30 @@ elif page == "📊 Feedback":
             n_atrisk   = sum(1 for r in y_real if r == "At Risk")
 
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Accuracy global",    f"{accuracy*100:.1f}%")
-            c2.metric("Recall At Risk",     f"{recall_ar*100:.1f}%" if recall_ar is not None else "—",
-                    delta="≥55% objetivo" if recall_ar is not None and recall_ar >= 0.55 else "bajo objetivo" if recall_ar is not None else None,
-                    delta_color="normal" if recall_ar is not None and recall_ar >= 0.55 else "inverse")
-            c3.metric("Precisión At Risk",  f"{prec_ar*100:.1f}%"  if prec_ar  is not None else "—")
+            c1.metric("Accuracy global",     f"{accuracy*100:.1f}%")
+            c2.metric("Recall At Risk",      f"{recall_ar*100:.1f}%" if recall_ar is not None else "—",
+                      delta="≥55% objetivo"  if recall_ar is not None and recall_ar >= 0.55 else "bajo objetivo" if recall_ar is not None else None,
+                      delta_color="normal"   if recall_ar is not None and recall_ar >= 0.55 else "inverse")
+            c3.metric("Precisión At Risk",   f"{prec_ar*100:.1f}%"  if prec_ar  is not None else "—")
             c4.metric("Casos At Risk reales", n_atrisk)
 
             st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
-
             col_left, col_right = st.columns(2, gap="large")
 
-            # ── Matriz de confusión ───────────────────────────────────────
             with col_left:
                 st.markdown("**Matriz de confusión**")
                 conf_data = {c: {c2: 0 for c2 in CLASSES_EN} for c in CLASSES_EN}
                 for p, r in zip(y_pred, y_real):
                     if r in conf_data and p in conf_data:
                         conf_data[r][p] += 1
-
                 rows = []
                 for real_cls in CLASSES_EN:
                     row = {"Real \\ Pred": EN_TO_ES[real_cls]}
                     for pred_cls in CLASSES_EN:
                         row[EN_TO_ES[pred_cls]] = conf_data[real_cls][pred_cls]
                     rows.append(row)
-
                 df_conf = pd.DataFrame(rows).set_index("Real \\ Pred")
 
-                # Colorear diagonal
                 def highlight_diag(df):
                     styles = pd.DataFrame("", index=df.index, columns=df.columns)
                     for i, col in enumerate(df.columns):
@@ -1084,12 +1135,8 @@ elif page == "📊 Feedback":
                             styles.iloc[i, i] = "background-color:#14532d;color:#4ade80;font-weight:bold"
                     return styles
 
-                st.dataframe(
-                    df_conf.style.apply(highlight_diag, axis=None),
-                    use_container_width=True
-                )
+                st.dataframe(df_conf.style.apply(highlight_diag, axis=None), use_container_width=True)
 
-            # ── Distribución de errores por clase ─────────────────────────
             with col_right:
                 st.markdown("**Distribución de errores por clase**")
                 error_data = []
@@ -1098,24 +1145,22 @@ elif page == "📊 Feedback":
                     errors = sum(1 for p, r in zip(y_pred, y_real) if r == cls and p != cls)
                     if total > 0:
                         error_data.append({
-                            "Clase":       EN_TO_ES[cls],
-                            "Total":       total,
-                            "Errores":     errors,
-                            "Aciertos":    total - errors,
-                            "Error (%)":   round(errors / total * 100, 1),
+                            "Clase":     EN_TO_ES[cls],
+                            "Total":     total,
+                            "Errores":   errors,
+                            "Aciertos":  total - errors,
+                            "Error (%)": round(errors / total * 100, 1),
                         })
-
                 if error_data:
                     df_err = pd.DataFrame(error_data)
                     for _, row in df_err.iterrows():
                         pct_ok  = (row["Aciertos"] / row["Total"]) * 100
-                        pct_err = row["Error (%)"]
                         color   = "#f87171" if row["Clase"] == "En Riesgo" else "#60a5fa"
                         st.markdown(
                             f"<div style='margin-bottom:0.7rem;'>"
                             f"<div style='display:flex;justify-content:space-between;margin-bottom:0.25rem;'>"
                             f"<span style='color:#e5e7eb;font-size:0.85rem;'>{row['Clase']}</span>"
-                            f"<span style='color:#9ca3af;font-size:0.82rem;'>{row['Errores']}/{row['Total']} errores ({pct_err}%)</span>"
+                            f"<span style='color:#9ca3af;font-size:0.82rem;'>{row['Errores']}/{row['Total']} errores ({row['Error (%)']}%)</span>"
                             f"</div>"
                             f"<div style='background:#1e2535;border-radius:4px;height:8px;overflow:hidden;'>"
                             f"<div style='width:{pct_ok:.1f}%;background:{color};height:100%;border-radius:4px;'></div>"
@@ -1123,9 +1168,7 @@ elif page == "📊 Feedback":
                             unsafe_allow_html=True
                         )
 
-            # ── Alerta si Recall At Risk < 0.55 ───────────────────────────
             if recall_ar is not None and recall_ar < 0.55:
-                st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
                 st.markdown(
                     "<div style='background:#1f0505;border:1px solid #7f1d1d;border-radius:8px;"
                     "padding:0.8rem 1rem;color:#f87171;font-size:0.88rem;'>"
@@ -1134,6 +1177,7 @@ elif page == "📊 Feedback":
                     "</div>",
                     unsafe_allow_html=True
                 )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PÁGINA 5 — INFORMACIÓN
